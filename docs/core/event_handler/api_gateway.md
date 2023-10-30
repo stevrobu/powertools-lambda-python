@@ -239,7 +239,7 @@ You can access the raw payload via `body` property, or if it's a JSON string you
 
 #### Headers
 
-Similarly to [Query strings](#query-strings-and-payload), you can access headers as dictionary via `app.current_event.headers`, or by name via `get_header_value`.
+Similarly to [Query strings](#query-strings-and-payload), you can access headers as dictionary via `app.current_event.headers`, or by name via `get_header_value`. If you prefer a case-insensitive lookup of the header value, the `app.current_event.get_header_value` function automatically handles it.
 
 ```python hl_lines="19" title="Accessing HTTP Headers"
 --8<-- "examples/event_handler_rest/src/accessing_request_details_headers.py"
@@ -575,7 +575,7 @@ These are native middlewares that may become native features depending on custom
 
 | Middleware                                                                                           | Purpose                                                                                                                                 |
 | ---------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| [SchemaValidationMiddleware](/api/event_handler/middlewares/schema_validation.html){target="_blank"} | Validates API request body and response against JSON Schema, using [Validation utility](../../utilities/validation.md){target="_blank"} |
+| [SchemaValidationMiddleware](/lambda/python/latest/api/event_handler/middlewares/schema_validation.html){target="_blank"} | Validates API request body and response against JSON Schema, using [Validation utility](../../utilities/validation.md){target="_blank"} |
 
 #### Being a good citizen
 
