@@ -45,6 +45,7 @@ from aws_lambda_powertools.utilities.data_classes import (
     LambdaFunctionUrlEvent,
     VPCLatticeEvent,
     VPCLatticeEventV2,
+    WebsocketEvent
 )
 from aws_lambda_powertools.utilities.data_classes.common import BaseProxyEvent
 from aws_lambda_powertools.utilities.typing import LambdaContext
@@ -86,6 +87,7 @@ class ProxyEventType(Enum):
     VPCLatticeEvent = "VPCLatticeEvent"
     VPCLatticeEventV2 = "VPCLatticeEventV2"
     LambdaFunctionUrlEvent = "LambdaFunctionUrlEvent"
+    WebsocketEvent = "WebsocketEvent"
 
 
 class CORSConfig:
@@ -675,6 +677,68 @@ class Route:
         operation_id = operation_id + "_" + self.method.lower()
         return operation_id
 
+class WebsocketRoute:
+    """Internally used Route Configuration"""
+
+    def __init__(
+        self,
+        #method: str,
+        rule: Pattern,
+        func: Callable,
+        #cors: bool,
+        #compress: bool,
+        cache_control: Optional[str],
+        middlewares: Optional[List[Callable[..., Response]]],
+    ):
+#        self.method = method.upper()
+        self.rule = rule
+        self.func = func
+        self._middleware_stack = func
+#        self.cors = cors
+#        self.compress = compress
+        self.cache_control = cache_control
+        self.middlewares = middlewares or []
+
+        # _middleware_stack_built is used to ensure the middleware stack is only built once.
+        self._middleware_stack_built = False
+
+    def __call__(
+        self,
+        router_middlewares: List[Callable],
+        app: "WebsocketResolver",
+        route_arguments: Dict[str, str],
+    ) -> Union[Dict, Tuple, Response]:
+        # Save CPU cycles by building middleware stack once
+        if not self._middleware_stack_built:
+            self._build_middleware_stack(router_middlewares=router_middlewares)
+
+        # If debug is turned on then output the middleware stack to the console
+        if app._debug:
+            print(f"\nProcessing Route:::{self.func.__name__} ({app.context['_path']})")
+            # Collect ALL middleware for debug printing - include internal _registered_api_adapter
+            all_middlewares = router_middlewares + self.middlewares + [_registered_api_adapter]
+            print("\nMiddleware Stack:")
+            print("=================")
+            print("\n".join(getattr(item, "__name__", "Unknown") for item in all_middlewares))
+            print("=================")
+
+        # Add Route Arguments to app context
+        app.append_context(_route_args=route_arguments)
+
+        # Call the Middleware Wrapped _call_stack function handler with the app
+        return self._middleware_stack(app)
+
+    def _build_middleware_stack(self, router_middlewares: List[Callable[..., Any]]) -> None:
+        all_middlewares = router_middlewares + self.middlewares
+        logger.debug(f"Building middleware stack: {all_middlewares}")
+
+        all_middlewares.append(_registered_api_adapter)
+
+        for handler in reversed(all_middlewares):
+            self._middleware_stack = MiddlewareFrame(current_middleware=handler, next_middleware=self._middleware_stack)
+
+        self._middleware_stack_built = True
+
 
 class ResponseBuilder:
     """Internally used Response builder"""
@@ -763,6 +827,57 @@ class ResponseBuilder:
             self.response.base64_encoded = True
             self.response.body = base64.b64encode(self.response.body).decode()
 
+        return {
+            "statusCode": self.response.status_code,
+            "body": self.response.body,
+            "isBase64Encoded": self.response.base64_encoded,
+            **event.header_serializer().serialize(headers=self.response.headers, cookies=self.response.cookies),
+        }
+
+class WebsocketResponseBuilder:
+    """Internally used Response builder"""
+
+    def __init__(self, response: Response, route: Optional[Route] = None):
+        self.response = response
+        self.route = route
+
+    def _add_cors(self, event: BaseProxyEvent, cors: CORSConfig):
+        """Update headers to include the configured Access-Control headers"""
+        self.response.headers.update(cors.to_dict(event.get_header_value("Origin")))
+
+    def _add_cache_control(self, cache_control: str):
+        """Set the specified cache control headers for 200 http responses. For non-200 `no-cache` is used."""
+        cache_control = cache_control if self.response.status_code == 200 else "no-cache"
+        self.response.headers["Cache-Control"] = cache_control
+
+    def _compress(self):
+        """Compress the response body, but only if `Accept-Encoding` headers includes gzip."""
+        self.response.headers["Content-Encoding"] = "gzip"
+        if isinstance(self.response.body, str):
+            logger.debug("Converting string response to bytes before compressing it")
+            self.response.body = bytes(self.response.body, "utf-8")
+        gzip = zlib.compressobj(9, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+        self.response.body = gzip.compress(self.response.body) + gzip.flush()
+
+    def _route(self, event: BaseProxyEvent, cors: Optional[CORSConfig]):
+        """Optionally handle any of the route's configure response handling"""
+        if self.route is None:
+            return
+        if self.route.cache_control:
+            self._add_cache_control(self.route.cache_control)
+
+    def build(self, event: BaseProxyEvent, cors: Optional[CORSConfig] = None) -> Dict[str, Any]:
+        """Build the full response dict to be returned by the lambda"""
+        self._route(event, cors)
+
+        if isinstance(self.response.body, bytes):
+            logger.debug("Encoding bytes response with base64")
+            self.response.base64_encoded = True
+            self.response.body = base64.b64encode(self.response.body).decode()
+
+        return {
+            "statusCode": self.response.status_code
+        }
         return {
             "statusCode": self.response.status_code,
             "body": self.response.body,
@@ -1919,6 +2034,448 @@ class ApiGatewayResolver(BaseRouter):
         flat_models = list(responses_from_routes + request_fields_from_routes + body_fields_from_routes)
         return flat_models
 
+
+class WebsocketRouter(BaseRouter):
+    current_event: WebsocketEvent
+    lambda_context: LambdaContext
+    context: dict
+    _router_middlewares: List[Callable] = []
+    processed_stack_frames: List[str] = []
+
+    def __init__(self):
+        self._routes: Dict[tuple, Callable] = {}
+        self._routes_with_middleware: Dict[tuple, List[Callable]] = {}
+        self.api_resolver: Optional[BaseRouter] = None
+        self.context = {}  # early init as customers might add context before event resolution
+
+    def route(
+        self,
+        rule: str#,
+        #method: Optional[Union[str, Union[List[str], Tuple[str]]]],
+        #cors: Optional[bool] = None,
+        #compress: bool = False,
+        #cache_control: Optional[str] = None,
+        #middlewares: Optional[List[Callable[..., Any]]] = None,
+    ):
+        def register_route(func: Callable):
+            # Convert methods to tuple. It needs to be hashable as its part of the self._routes dict key
+            # methods = (method,) if isinstance(method, str) else tuple(method)
+
+            route_key = (rule) #, methods, cors, compress, cache_control)
+
+            # Collate Middleware for routes
+            # if middlewares is not None:
+            #     for handler in middlewares:
+            #         if self._routes_with_middleware.get(route_key) is None:
+            #             self._routes_with_middleware[route_key] = [handler]
+            #         else:
+            #             self._routes_with_middleware[route_key].append(handler)
+            # else:
+            #self._routes_with_middleware[route_key] = []
+
+            self._routes[route_key] = func
+
+            return func
+
+        return register_route
+
+    # def use(self, middlewares: List[Callable[..., Response]]) -> None:
+    #     self._router_middlewares = self._router_middlewares + middlewares
+
+    # def _push_processed_stack_frame(self, frame: str):
+    #     """
+    #     Add Current Middleware to the Middleware Stack Frames
+    #     The stack frames will be used when exceptions are thrown and Powertools
+    #     debug is enabled by developers.
+    #     """
+    #     self.processed_stack_frames.append(frame)
+
+    # def _reset_processed_stack(self):
+    #     """Reset the Processed Stack Frames"""
+    #     self.processed_stack_frames.clear()
+
+    # def append_context(self, **additional_context):
+    #     """Append key=value data as routing context"""
+    #     self.context.update(**additional_context)
+
+    # def clear_context(self):
+    #     """Resets routing context"""
+    #     self.context.clear()
+
+class WebsocketResolver(WebsocketRouter):
+    def __init__(
+        self,
+        proxy_type: Enum = ProxyEventType.WebsocketEvent,
+        cors: Optional[CORSConfig] = None,
+        debug: Optional[bool] = None,
+        serializer: Optional[Callable[[Dict], str]] = None,
+        strip_prefixes: Optional[List[Union[str, Pattern]]] = None,
+    ):
+        self._proxy_type = proxy_type
+        self._dynamic_routes: List[Route] = []
+        self._static_routes: List[Route] = []
+        self._route_keys: List[str] = []
+        self._exception_handlers: Dict[Type, Callable] = {}
+        self._cors = cors
+        self._cors_enabled: bool = cors is not None
+        self._cors_methods: Set[str] = {"OPTIONS"}
+        self._debug = self._has_debug(debug)
+        self._strip_prefixes = strip_prefixes
+        self.context: Dict = {}  # early init as customers might add context before event resolution
+        self.processed_stack_frames = []
+
+        # Allow for a custom serializer or a concise json serialization
+        self._serializer = serializer or partial(json.dumps, separators=(",", ":"), cls=Encoder)
+
+    def route(
+        self,
+        rule: str,
+        #method: Union[str, Union[List[str], Tuple[str]]],
+        cors: Optional[bool] = None,
+        compress: bool = False,
+        cache_control: Optional[str] = None,
+        middlewares: Optional[List[Callable[..., Any]]] = None,
+    ):
+        """Route decorator includes parameter `method`"""
+
+        def register_resolver(func: Callable):
+            #methods = (method,) if isinstance(method, str) else method
+            #logger.debug(f"Adding route using rule {rule} and methods: {','.join((m.upper() for m in methods))}")
+            #if cors is None:
+            #    cors_enabled = self._cors_enabled
+            #else:
+            #    cors_enabled = cors
+            self._static_routes.append(WebsocketRoute(self._compile_regex(rule), func, cache_control, middlewares))
+
+            return func
+
+        return register_resolver
+
+    def resolve(self, event, context) -> Dict[str, Any]:
+        if isinstance(event, BaseProxyEvent):
+            warnings.warn(
+                "You don't need to serialize event to Event Source Data Class when using Event Handler; "
+                "see issue #1152",
+                stacklevel=2,
+            )
+            event = event.raw_event
+
+        if self._debug:
+            print(self._json_dump(event))
+
+        # Populate router(s) dependencies without keeping a reference to each registered router
+        BaseRouter.current_event = self._to_proxy_event(event)
+        BaseRouter.lambda_context = context
+
+        print(BaseRouter.current_event)
+        print(BaseRouter.lambda_context)
+
+        response = self._resolve().build(self.current_event, self._cors)
+
+        # Debug print Processed Middlewares
+        if self._debug:
+            print("\nProcessed Middlewares:")
+            print("======================")
+            print("\n".join(self.processed_stack_frames))
+            print("======================")
+
+        self.clear_context()
+
+        return response
+
+    def __call__(self, event, context) -> Any:
+        return self.resolve(event, context)
+
+    @staticmethod
+    def _has_debug(debug: Optional[bool] = None) -> bool:
+        # It might have been explicitly switched off (debug=False)
+        if debug is not None:
+            return debug
+
+        return powertools_dev_is_set()
+
+    @staticmethod
+    def _compile_regex(rule: str, base_regex: str = _ROUTE_REGEX):
+        """Precompile regex pattern
+
+        Logic
+        -----
+
+        1. Find any dynamic routes defined as <pattern>
+            e.g. @app.get("/accounts/<account_id>")
+        2. Create a new regex by substituting every dynamic route found as a named group (?P<group>),
+        and match whole words only (word boundary) instead of a greedy match
+
+            non-greedy example with word boundary
+
+                rule: '/accounts/<account_id>'
+                regex: r'/accounts/(?P<account_id>\\w+\\b)'
+
+                value: /accounts/123/some_other_path
+                account_id: 123
+
+            greedy example without word boundary
+
+                regex: r'/accounts/(?P<account_id>.+)'
+
+                value: /accounts/123/some_other_path
+                account_id: 123/some_other_path
+        3. Compiles a regex and include start (^) and end ($) in between for an exact match
+
+        NOTE: See #520 for context
+        """
+        rule = rule.replace('$', '\\$')
+        rule_regex: str = re.sub(_DYNAMIC_ROUTE_PATTERN, _NAMED_GROUP_BOUNDARY_PATTERN, rule)
+        return re.compile(base_regex.format(rule_regex))
+
+    def _to_proxy_event(self, event: Dict) -> BaseProxyEvent:
+        """Convert the event dict to the corresponding data class"""
+        if self._proxy_type == ProxyEventType.APIGatewayProxyEvent:
+            logger.debug("Converting event to API Gateway REST API contract")
+            return APIGatewayProxyEvent(event)
+        if self._proxy_type == ProxyEventType.APIGatewayProxyEventV2:
+            logger.debug("Converting event to API Gateway HTTP API contract")
+            return APIGatewayProxyEventV2(event)
+        if self._proxy_type == ProxyEventType.LambdaFunctionUrlEvent:
+            logger.debug("Converting event to Lambda Function URL contract")
+            return LambdaFunctionUrlEvent(event)
+        if self._proxy_type == ProxyEventType.VPCLatticeEvent:
+            logger.debug("Converting event to VPC Lattice contract")
+            return VPCLatticeEvent(event)
+        if self._proxy_type == ProxyEventType.VPCLatticeEventV2:
+            logger.debug("Converting event to VPC LatticeV2 contract")
+            return VPCLatticeEventV2(event)
+        if self._proxy_type == ProxyEventType.WebsocketEvent:
+            logger.debug("Converting event to API Gateway Websocket contract")
+            return WebsocketEvent(event)
+        logger.debug("Converting event to ALB contract")
+        return ALBEvent(event)
+
+    def _resolve(self) -> WebsocketResponseBuilder:
+        """Resolves the response or return the not found response"""
+        #method = self.current_event.http_method.upper()
+        route_key = self._remove_prefix(self.current_event.route_key)
+
+        for route in self._static_routes + self._dynamic_routes:
+            # if method != route.method:
+            #     continue
+            match_results: Optional[Match] = route.rule.match(route_key)
+            if match_results:
+                logger.debug("Found a registered route. Calling function")
+                # Add matched Route reference into the Resolver context
+                self.append_context(_route=route, _path=route_key)
+
+                return self._call_route(route, match_results.groupdict())  # pass fn args
+
+#        logger.debug(f"No match found for path {path} and method {method}")
+        logger.debug(f"No match found for route {route_key}")
+        return self._not_found(route_key)
+
+    def _remove_prefix(self, path: str) -> str:
+        """Remove the configured prefix from the path"""
+        if not isinstance(self._strip_prefixes, list):
+            return path
+
+        for prefix in self._strip_prefixes:
+            if isinstance(prefix, str):
+                if path == prefix:
+                    return "/"
+
+                if self._path_starts_with(path, prefix):
+                    return path[len(prefix) :]
+
+            if isinstance(prefix, Pattern):
+                path = re.sub(prefix, "", path)
+
+                # When using regexes, we might get into a point where everything is removed
+                # from the string, so we check if it's empty and return /, since there's nothing
+                # else to strip anymore.
+                if not path:
+                    return "/"
+
+        return path
+
+    @staticmethod
+    def _path_starts_with(path: str, prefix: str):
+        """Returns true if the `path` starts with a prefix plus a `/`"""
+        if not isinstance(prefix, str) or prefix == "":
+            return False
+
+        return path.startswith(prefix + "/")
+
+    def _not_found(self, method: str) -> WebsocketResponseBuilder:
+        pass
+        # TODO: Need to figure out what to return
+        # """Called when no matching route was found and includes support for the cors preflight response"""
+        # headers: Dict[str, Union[str, List[str]]] = {}
+        # if self._cors:
+        #     logger.debug("CORS is enabled, updating headers.")
+        #     headers.update(self._cors.to_dict(self.current_event.get_header_value("Origin")))
+
+        #     if method == "OPTIONS":
+        #         logger.debug("Pre-flight request detected. Returning CORS with null response")
+        #         headers["Access-Control-Allow-Methods"] = ",".join(sorted(self._cors_methods))
+        #         return WebsocketResponseBuilder(Response(status_code=204, content_type=None, headers=headers, body=""))
+
+        # handler = self._lookup_exception_handler(NotFoundError)
+        # if handler:
+        #     return WebsocketResponseBuilder(handler(NotFoundError()))
+
+        # return WebsocketResponseBuilder(
+        #     Response(
+        #         status_code=HTTPStatus.NOT_FOUND.value,
+        #         content_type=content_types.APPLICATION_JSON,
+        #         headers=headers,
+        #         body=self._json_dump({"statusCode": HTTPStatus.NOT_FOUND.value, "message": "Not found"}),
+        #     ),
+        # )
+
+    def _call_route(self, route: Route, route_arguments: Dict[str, str]) -> WebsocketResponseBuilder:
+        """Actually call the matching route with any provided keyword arguments."""
+        try:
+            # Reset Processed stack for Middleware (for debugging purposes)
+            self._reset_processed_stack()
+
+            return WebsocketResponseBuilder(
+                self._to_response(
+                    route(router_middlewares=self._router_middlewares, app=self, route_arguments=route_arguments),
+                ),
+                route,
+            )
+        except Exception as exc:
+            # If exception is handled then return the response builder to reduce noise
+            response_builder = self._call_exception_handler(exc, route)
+            if response_builder:
+                return response_builder
+
+            logger.exception(exc)
+            if self._debug:
+                # If the user has turned on debug mode,
+                # we'll let the original exception propagate so
+                # they get more information about what went wrong.
+                return WebsocketResponseBuilder(
+                    Response(
+                        status_code=500,
+                        content_type=content_types.TEXT_PLAIN,
+                        body="".join(traceback.format_exc()),
+                    ),
+                    route,
+                )
+
+            raise
+
+    def not_found(self, func: Optional[Callable] = None):
+        if func is None:
+            return self.exception_handler(NotFoundError)
+        return self.exception_handler(NotFoundError)(func)
+
+    def exception_handler(self, exc_class: Union[Type[Exception], List[Type[Exception]]]):
+        def register_exception_handler(func: Callable):
+            if isinstance(exc_class, list):
+                for exp in exc_class:
+                    self._exception_handlers[exp] = func
+            else:
+                self._exception_handlers[exc_class] = func
+            return func
+
+        return register_exception_handler
+
+    def _lookup_exception_handler(self, exp_type: Type) -> Optional[Callable]:
+        # Use "Method Resolution Order" to allow for matching against a base class
+        # of an exception
+        for cls in exp_type.__mro__:
+            if cls in self._exception_handlers:
+                return self._exception_handlers[cls]
+        return None
+
+    def _call_exception_handler(self, exp: Exception, route: Route) -> Optional[ResponseBuilder]:
+        handler = self._lookup_exception_handler(type(exp))
+        if handler:
+            try:
+                return ResponseBuilder(handler(exp), route)
+            except ServiceError as service_error:
+                exp = service_error
+
+        if isinstance(exp, ServiceError):
+            return ResponseBuilder(
+                Response(
+                    status_code=exp.status_code,
+                    content_type=content_types.APPLICATION_JSON,
+                    body=self._json_dump({"statusCode": exp.status_code, "message": exp.msg}),
+                ),
+                route,
+            )
+
+        return None
+
+    def _to_response(self, result: Union[Dict, Tuple, Response]) -> Response:
+        """Convert the route's result to a Response
+
+         3 main result types are supported:
+
+        - Dict[str, Any]: Rest api response with just the Dict to json stringify and content-type is set to
+          application/json
+        - Tuple[dict, int]: Same dict handling as above but with the option of including a status code
+        - Response: returned as is, and allows for more flexibility
+        """
+        status_code = HTTPStatus.OK
+        if isinstance(result, Response):
+            return result
+        elif isinstance(result, tuple) and len(result) == 2:
+            # Unpack result dict and status code from tuple
+            result, status_code = result
+
+        logger.debug("Simple response detected, serializing return before constructing final response")
+        return Response(
+            status_code=status_code,
+            content_type=content_types.APPLICATION_JSON,
+            body=self._json_dump(result),
+        )
+
+    def _json_dump(self, obj: Any) -> str:
+        return self._serializer(obj)
+
+    def include_router(self, router: "Router", prefix: Optional[str] = None) -> None:
+        """Adds all routes and context defined in a router
+
+        Parameters
+        ----------
+        router : Router
+            The Router containing a list of routes to be registered after the existing routes
+        prefix : str, optional
+            An optional prefix to be added to the originally defined rule
+        """
+
+        # Add reference to parent ApiGatewayResolver to support use cases where people subclass it to add custom logic
+        router.api_resolver = self
+
+        logger.debug("Merging App context with Router context")
+        self.context.update(**router.context)
+
+        logger.debug("Appending Router middlewares into App middlewares.")
+        self._router_middlewares = self._router_middlewares + router._router_middlewares
+
+        # use pointer to allow context clearance after event is processed e.g., resolve(evt, ctx)
+        router.context = self.context
+
+        for route, func in router._routes.items():
+            new_route = route
+
+            if prefix:
+                rule = route[0]
+                rule = prefix if rule == "/" else f"{prefix}{rule}"
+                new_route = (rule, *route[1:])
+
+            # Middlewares are stored by route separately - must grab them to include
+            #middlewares = router._routes_with_middleware.get(new_route)
+
+            # Need to use "type: ignore" here since mypy does not like a named parameter after
+            # tuple expansion since may cause duplicate named parameters in the function signature.
+            # In this case this is not possible since the tuple expansion is from a hashable source
+            # and the `middlewares` List is a non-hashable structure so will never be included.
+            # Still need to ignore for mypy checks or will cause failures (false-positive)
+            #self.route(*new_route, middlewares=middlewares)(func)  # type: ignore
+            self.route(new_route)(func)  # type: ignore
 
 class Router(BaseRouter):
     """Router helper class to allow splitting ApiGatewayResolver into multiple files"""

@@ -9,6 +9,7 @@ from aws_lambda_powertools.event_handler.api_gateway import (
     APIGatewayRestResolver,
     CORSConfig,
     Response,
+    WebsocketRouter
 )
 from aws_lambda_powertools.event_handler.appsync import AppSyncResolver
 from aws_lambda_powertools.event_handler.lambda_function_url import (
@@ -27,4 +28,5 @@ __all__ = [
     "Response",
     "VPCLatticeResolver",
     "VPCLatticeV2Resolver",
+    "WebsocketRouter"
 ]

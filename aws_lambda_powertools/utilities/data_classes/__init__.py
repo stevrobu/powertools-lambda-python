@@ -28,6 +28,7 @@ from .ses_event import SESEvent
 from .sns_event import SNSEvent
 from .sqs_event import SQSEvent
 from .vpc_lattice import VPCLatticeEvent, VPCLatticeEventV2
+from .websocket_event import WebsocketEvent
 
 __all__ = [
     "APIGatewayProxyEvent",
@@ -57,4 +58,5 @@ __all__ = [
     "AWSConfigRuleEvent",
     "VPCLatticeEvent",
     "VPCLatticeEventV2",
+    "WebsocketEvent"
 ]
